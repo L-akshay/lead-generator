@@ -11,7 +11,7 @@ export async function GET(
 
   const { data, error } = await supabaseAdmin
     .from('leads')
-    .select('id, status, current_stage, name, company, pdf_url, error_log')
+    .select('id, status, current_stage, name, company, pdf_url, error_log, email_sent_at, sheets_logged_at, drive_archived_at')
     .eq('id', id)
     .single();
 

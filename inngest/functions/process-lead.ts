@@ -2,6 +2,12 @@ import { inngest, leadSubmitted } from '@/inngest/client';
 import { enrichLead } from '@/lib/enrichment';
 import type { EnrichedData } from '@/lib/enrichment/types';
 import { generateAudit } from '@/lib/llm/audit-generator';
+import type { Audit } from '@/lib/llm/audit-schema';
+import { renderAuditPdf } from '@/lib/pdf/render';
+import { uploadAuditPdf } from '@/lib/pdf/storage';
+import { sendAuditEmail } from '@/lib/email/send';
+import { appendLeadRow } from '@/lib/google/sheets';
+import { uploadPdfToDrive } from '@/lib/google/drive';
 import { supabaseAdmin } from '@/lib/supabase';
 import type { LeadStatus } from '@/lib/supabase';
 
@@ -130,20 +136,158 @@ export const processLead = inngest.createFunction(
     // ── STEP 3: RENDER PDF ─────────────────────────────────────────
     const pdfMeta = await step.run('render-pdf', async () => {
       await updateStatus(leadId, 'rendering', 'render-pdf');
-      // Block 5: real PDF render + Drive upload goes here.
-      await wait(800);
-      const stub = {
-        pdfUrl: null,
-        sizeBytes: 0,
-      };
-      return stub;
+
+      // Re-fetch lead — Supabase is source of truth for enriched + audit data.
+      const { data: lead, error: leadErr } = await supabaseAdmin
+        .from('leads')
+        .select('company, enriched_data, audit_data')
+        .eq('id', leadId)
+        .single();
+
+      if (leadErr || !lead) {
+        throw new Error(`Failed to load lead ${leadId} for PDF render: ${leadErr?.message}`);
+      }
+      if (!lead.audit_data) {
+        throw new Error(`Lead ${leadId} has no audit_data — was step 2 skipped?`);
+      }
+
+      const { buffer, sizeBytes } = await renderAuditPdf({
+        audit: lead.audit_data as Audit,
+        enriched: lead.enriched_data as EnrichedData,
+      });
+
+      const { publicUrl, storagePath } = await uploadAuditPdf({
+        leadId,
+        companyName: lead.company,
+        buffer,
+      });
+
+      await supabaseAdmin
+        .from('leads')
+        .update({ pdf_url: publicUrl })
+        .eq('id', leadId);
+
+      logger.info('PDF rendered + uploaded', { leadId, sizeBytes, publicUrl, storagePath });
+
+      return { pdfUrl: publicUrl, sizeBytes };
     });
 
     // ── STEP 4: DELIVER (email + sheets + drive) ───────────────────
     await step.run('deliver', async () => {
       await updateStatus(leadId, 'sending', 'deliver');
-      // Block 6: parallel Resend + Sheets append + final updates here.
-      await wait(600);
+
+      // Source of truth: re-read everything from Supabase.
+      const { data: lead, error: leadErr } = await supabaseAdmin
+        .from('leads')
+        .select('id, name, email, company, website, audit_data, pdf_url, email_sent_at, sheets_logged_at, drive_archived_at')
+        .eq('id', leadId)
+        .single();
+
+      if (leadErr || !lead) {
+        throw new Error(`Failed to load lead ${leadId} for delivery: ${leadErr?.message}`);
+      }
+      if (!lead.audit_data) throw new Error(`Lead ${leadId} has no audit_data`);
+      if (!lead.pdf_url) throw new Error(`Lead ${leadId} has no pdf_url`);
+
+      // Fetch the PDF buffer from Supabase Storage — we need bytes to attach to
+      // the email and re-upload to Drive.
+      const pdfRes = await fetch(lead.pdf_url);
+      if (!pdfRes.ok) throw new Error(`Failed to fetch PDF buffer: HTTP ${pdfRes.status}`);
+      const pdfBuffer = Buffer.from(await pdfRes.arrayBuffer());
+
+      const audit = lead.audit_data as Audit;
+      const firstName = lead.name.split(' ')[0] || lead.name;
+      const safeCompany = lead.company.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'company';
+      const pdfFileName = `simplifiq-audit-${safeCompany}.pdf`;
+
+      // Run all 3 side effects in parallel; idempotency guards skip already-done work.
+      const [emailResult, sheetsResult, driveResult] = await Promise.allSettled([
+        (async () => {
+          if (lead.email_sent_at) return { skipped: true as const };
+          const out = await sendAuditEmail({
+            toEmail: lead.email,
+            prospectFirstName: firstName,
+            audit,
+            pdfBuffer,
+            pdfFileName,
+          });
+          await supabaseAdmin
+            .from('leads')
+            .update({ email_sent_at: new Date().toISOString() })
+            .eq('id', leadId);
+          return { skipped: false as const, messageId: out.messageId };
+        })(),
+
+        (async () => {
+          if (lead.sheets_logged_at) return { skipped: true as const };
+          await appendLeadRow({
+            leadId: lead.id,
+            name: lead.name,
+            email: lead.email,
+            company: lead.company,
+            website: lead.website,
+            status: 'completed',
+            pdfUrl: lead.pdf_url,
+          });
+          await supabaseAdmin
+            .from('leads')
+            .update({ sheets_logged_at: new Date().toISOString() })
+            .eq('id', leadId);
+          return { skipped: false as const };
+        })(),
+
+        (async () => {
+          if (lead.drive_archived_at) return { skipped: true as const };
+          const out = await uploadPdfToDrive({
+            buffer: pdfBuffer,
+            fileName: pdfFileName,
+          });
+          await supabaseAdmin
+            .from('leads')
+            .update({
+              drive_archived_at: new Date().toISOString(),
+              drive_file_id: out.fileId,
+            })
+            .eq('id', leadId);
+          return { skipped: false as const, fileId: out.fileId };
+        })(),
+      ]);
+
+      const failures: Array<{ stage: string; error: string; ts: string }> = [];
+      const ts = new Date().toISOString();
+
+      if (emailResult.status === 'rejected') {
+        failures.push({ stage: 'email', error: String(emailResult.reason), ts });
+        logger.error('Email send failed', { leadId, error: String(emailResult.reason) });
+      } else {
+        logger.info('Email', { leadId, ...emailResult.value });
+      }
+
+      if (sheetsResult.status === 'rejected') {
+        failures.push({ stage: 'sheets', error: String(sheetsResult.reason), ts });
+        logger.error('Sheets append failed', { leadId, error: String(sheetsResult.reason) });
+      } else {
+        logger.info('Sheets', { leadId, ...sheetsResult.value });
+      }
+
+      if (driveResult.status === 'rejected') {
+        failures.push({ stage: 'drive', error: String(driveResult.reason), ts });
+        logger.error('Drive upload failed', { leadId, error: String(driveResult.reason) });
+      } else {
+        logger.info('Drive', { leadId, ...driveResult.value });
+      }
+
+      // Completion policy: email is the only prospect-facing side effect.
+      // If it fails, throw so Inngest retries. Sheets/Drive failures are
+      // logged but never block completion.
+      if (emailResult.status === 'rejected') {
+        await appendErrorLog(leadId, failures);
+        throw new Error('Email delivery failed — Inngest will retry');
+      }
+
+      if (failures.length > 0) {
+        await appendErrorLog(leadId, failures);
+      }
       await supabaseAdmin
         .from('leads')
         .update({
@@ -172,4 +316,21 @@ async function updateStatus(
 
 function wait(ms: number) {
   return new Promise((res) => setTimeout(res, ms));
+}
+
+async function appendErrorLog(
+  leadId: string,
+  entries: Array<{ stage: string; error: string; ts: string }>
+) {
+  const { data } = await supabaseAdmin
+    .from('leads')
+    .select('error_log')
+    .eq('id', leadId)
+    .single();
+
+  const existing = (data?.error_log as Array<{ stage: string; error: string; ts: string }>) ?? [];
+  await supabaseAdmin
+    .from('leads')
+    .update({ error_log: [...existing, ...entries] })
+    .eq('id', leadId);
 }
