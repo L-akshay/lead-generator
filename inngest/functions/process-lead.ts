@@ -1,5 +1,7 @@
 import { inngest, leadSubmitted } from '@/inngest/client';
 import { enrichLead } from '@/lib/enrichment';
+import type { EnrichedData } from '@/lib/enrichment/types';
+import { generateAudit } from '@/lib/llm/audit-generator';
 import { supabaseAdmin } from '@/lib/supabase';
 import type { LeadStatus } from '@/lib/supabase';
 
@@ -85,17 +87,44 @@ export const processLead = inngest.createFunction(
     // ── STEP 2: GENERATE AUDIT ─────────────────────────────────────
     const audit = await step.run('generate-audit', async () => {
       await updateStatus(leadId, 'generating', 'generate-audit');
-      // Block 4: real Claude call goes here.
-      await wait(1000);
-      const stub = {
-        executiveSummary: 'STUB: full audit will replace this in Block 4.',
-        sections: [],
-      };
+
+      // Re-fetch the lead to get name + company + freshly-written enriched_data.
+      // We read from the DB rather than relying on the previous step's return
+      // value because Inngest serializes step output as JSON in its store
+      // (Supabase is our source of truth for the dossier).
+      const { data: lead, error: leadErr } = await supabaseAdmin
+        .from('leads')
+        .select('name, company, website, enriched_data')
+        .eq('id', leadId)
+        .single();
+
+      if (leadErr || !lead) {
+        throw new Error(`Failed to load lead ${leadId} for audit generation: ${leadErr?.message}`);
+      }
+      if (!lead.enriched_data) {
+        throw new Error(`Lead ${leadId} has no enriched_data — was step 1 skipped?`);
+      }
+
+      const result = await generateAudit({
+        companyName: lead.company,
+        website: lead.website,
+        prospectName: lead.name,
+        enriched: lead.enriched_data as EnrichedData,
+      });
+
       await supabaseAdmin
         .from('leads')
-        .update({ audit_data: stub })
+        .update({ audit_data: result.audit })
         .eq('id', leadId);
-      return stub;
+
+      logger.info('Audit generated', {
+        leadId,
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        durationMs: result.durationMs,
+      });
+
+      return result.audit;
     });
 
     // ── STEP 3: RENDER PDF ─────────────────────────────────────────

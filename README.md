@@ -47,3 +47,11 @@ Four parallel enrichment sources run via `Promise.allSettled`:
 | Tech stack    | header + script sniff   | 30+ signatures across 6 categories       |
 
 Each source returns `{ data, source, confidence, error?, durationMs }`. The orchestrator never throws — failures degrade gracefully. Each external call has its own timeout (`withTimeout`) and retries with exponential backoff (`retryWithBackoff`).
+
+## Audit Generation (Block 4)
+
+Gemini 2.5 Flash produces the audit via Google's **structured output** feature (`responseMimeType: 'application/json'` + `responseSchema`), which forces JSON matching our schema. The audit has 8 sections: cover, executive summary, company snapshot, industry positioning, observed strengths, opportunity areas, next steps, closing note. Every field is validated post-generation with Zod (defense in depth — LLMs occasionally violate their own response schemas).
+
+The prompt briefs Gemini like a senior strategy consultant: enrichment dossier first, then strict output rules (specificity, no fabrication, evidence citation, professional voice). Temperature 0.4 balances grounded language with non-robotic phrasing.
+
+**Why Flash over Sonnet:** Single-vendor stack on Gemini reduces auth and SDK complexity. Flash handles structured analytical output well at significantly lower cost and faster latency than premium models. Tradeoff: marginal quality loss vs. operational simplicity — worth benchmarking against Sonnet if quality data showed it materially improved conversion.
